@@ -256,7 +256,7 @@ compile_shader:
 	mov     [rsp+0x00], rsi ; src len address
 	mov     [rsp+0x08], rdx ; src address ptr
 
-	call    glCreateShader ; type already in rdi
+	call    glCreateShader ; type already in edi
 	mov     [rsp+0x10], rax ; shader id
 
 	mov     rcx, [rsp+0x00]

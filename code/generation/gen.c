@@ -16,8 +16,8 @@ void emit_hex_data(char* label, char* in_filename, FILE* out_file) {
 }
 
 int main(void) {
-	FILE* out = fopen("generated_data.asm", "w");
-	emit_hex_data("vert_src", "../shaders/screen.vert", out);
-	emit_hex_data("frag_src", "../shaders/screen.frag", out);
+	FILE* out = fopen("code/generation/generated_data.asm", "w");
+	emit_hex_data("vert_src", "code/shaders/screen.vert", out);
+	emit_hex_data("frag_src", "code/shaders/screen.frag", out);
 	fclose(out);
 }
