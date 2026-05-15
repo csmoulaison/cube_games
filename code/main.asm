@@ -1,8 +1,8 @@
 format ELF64
 
-;=========================
+;===========================================================
 section '.text' executable
-;=========================
+;===========================================================
 
 ; When linking with gl3w, we ge an undefined reference to
 ; __dso_handle. This shit is a little too esoteric for my
@@ -132,7 +132,7 @@ pixel_loop:
 	lea     rsi, [screen+rdi]
 	mov     byte [rsi], dl
 	inc     rdi
-	cmp     rdi, 921600
+	cmp     rdi, logical_w * logical_h * 4
 	jne     pixel_loop
 
 	push    0
@@ -140,8 +140,8 @@ pixel_loop:
 	push    0x1401 ; GL_UNSIGNED_BYTE
 	push    0x1908 ; GL_RGBA
 	mov     r9d, 0
-	mov     r8d, [logical_h]
-	mov     ecx, [logical_w]
+	mov     r8d, logical_h
+	mov     ecx, logical_w
 	mov     edx, 0x1908 ; GL_RGBA
 	mov     esi, 0
 	mov     edi, 0x0DE1 ; GL_TEXTURE_2D
@@ -214,7 +214,8 @@ pixel_loop:
 	call    glDeleteShader
 	; r12, r13 are free for use
 
-
+;===========================================================
+; MAIN LOOP:
 ; This runs repeatedly until the program wants to exit
 loop_begin:
 	mov     rdi, [glfw_window]
@@ -222,6 +223,27 @@ loop_begin:
 	cmp     eax, 1
 	je      exit
 
+	; Update pixels
+	mov     edx, 0xff0044ff
+	mov     rsi, 50
+	mov     rdi, [player_x]
+	call    put_color
+	add     [player_x], 3
+
+	push    0
+	push    screen
+	push    0x1401 ; GL_UNSIGNED_BYTE
+	push    0x1908 ; GL_RGBA
+	mov     r9d, 0
+	mov     r8d, logical_h
+	mov     ecx, logical_w
+	mov     edx, 0x1908 ; GL_RGBA
+	mov     esi, 0
+	mov     edi, 0x0DE1 ; GL_TEXTURE_2D
+	call    glTexImage2D
+	add     rsp, 32
+
+	; Update renderer
 	sub     rsp, 16 ; make space for framebuffer dimensions
 	lea     rdx, [rsp+0x00] ; width
 	lea     rsi, [rsp+0x08] ; height
@@ -273,7 +295,8 @@ exit:
 	xor     rdi, rdi
     syscall 
 
-; Compiles a shader for OpenGL
+; ==========================================================
+; Compiles a shader for OpenGL.
 ;
 ; input
 ;   rdx: src address ptr
@@ -309,7 +332,7 @@ compile_shader:
 	; Log error if shader compilation failed
 	mov     rcx, msg
 	mov     rdx, 0
-	mov     rsi, 100
+	mov     rsi, msglen
 	mov     rdi, [rsp+0x10]
 	call    glGetShaderInfoLog
 
@@ -330,22 +353,52 @@ compile_shader_success:
 	add     rsp, 40
 	ret
 
-;========================
+;===========================================================
+; Writes an rgb value to the screen buffer.
+;
+; NOTE: This will likely be inlined as part of the render
+; loop, obvs
+;
+; input:
+;   edx: color
+;   rsi: y
+;   rdi: x
+; output: none
+put_color:
+	add     rsp, 8
+	mov     [rsp], edx
+	mov     r10, rsi
+	xor     rax, rax
+	mov     eax, logical_w
+	mul     r10
+	mov     r10, rax
+	add     r10, rdi ; r10 is now (y * width + x)
+	mov     rax, 4
+	mul     r10 ; multiply r10 by color channels (4)
+	lea     r9, [screen+rax] ; r9 now pointing to screen pixel
+	mov     r11, [rsp]
+	mov     dword [r9], r11d ; Write pixel
+	sub     rsp, 8
+
+;===========================================================
 section '.data' writeable
-;========================
+;===========================================================
 
 msglen = 4096
 msg         rd msglen; general purpose string buffer
 window_name db 'Cube Games', 0
+
+; game state
+player_x     dq 0
 
 ; render data
 glfw_window  rq 1
 gl_texture   rd 1
 gl_vao       rd 1
 gl_program   rd 1
-logical_w    dd 640
-logical_h    dd 360
-screen       rb 640 * 360 * 4
+logical_w = 128
+logical_h = 128
+screen       rb logical_w * logical_h * 4
 clear_r      dd 0.3
 clear_g      dd 0.1
 clear_b      dd 0.2
