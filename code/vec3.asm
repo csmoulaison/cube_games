@@ -12,21 +12,21 @@
 ; output:
 ;   v: normalized
 ; volatile:
-;   xmm0-xmm2
+;   xmm1-xmm2
 macro v3norm v {
     local is_zero
     local end
     movaps  xmm1, v             ; v and xmm1 both have vector
     dpps    xmm1, xmm1, 11111111b ; xmm1 has dot product
-    sqrtps  xmm1, xmm1          ; xmm1 has magnitude
+    rsqrtps xmm1, xmm1          ; xmm1 has reciprocal square root
     pxor    xmm2, xmm2
     ucomiss xmm1, xmm2          ; if xmm1 has magnitude 0, we return 0
     je      is_zero
 
-    divps   v, xmm1
+    mulps   v, xmm1
     jmp end
 is_zero:
-    movaps  v, xmm1             ; xmm1 should be zero here
+    movaps  v, xmm2             ; xmm1 should be zero here
 end:
 }
 

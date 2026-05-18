@@ -21,6 +21,10 @@ public __dso_handle
 __dso_handle:
     dd 0
 
+; libc
+extrn sinf
+extrn cosf
+extrn printf
 ; glfw
 extrn glfwInit
 extrn glfwCreateWindow
@@ -202,6 +206,62 @@ loop_begin:
     cmp     eax, 1
     je      exit
 
+    ; Orbit camera around the origin
+    ;   x = dist * sin(phi) * cos(theta);
+    ;   y = dist * cos(phi);
+    ;   z = dist * sin(phi) * sin(theta);
+    ; theta being left/right and phi being up/down
+    mov     edi, [cam_theta]
+    movd    xmm0, edi           ; xmm0, cam_theta
+    addss   xmm0, [cam_theta_per_sec]
+    lea     r9, [cam_theta]
+    movd    [r9], xmm0          ; cam_theta += cam_theta_per_second
+
+    movss   xmm0, [cam_theta]
+    call    cosf
+    movss   xmm1, xmm0          ; xmm1: cos(theta)
+    movss   xmm0, [cam_phi]
+    call    sinf
+    movss   xmm2, xmm0          ; xmm2: sin(phi)
+    movss   xmm0, [cam_phi]
+    call    cosf
+    movss   xmm3, xmm0          ; xmm3: cos(phi)
+    movss   xmm0, [cam_theta]
+    call    sinf                ; xmm0: sin(theta)
+
+    lea     r9, [cam_dist]      ; xmm4-6 will be x,y,z
+    cvtss2sd xmm4, [cam_dist]
+    cvtss2sd xmm5, [cam_dist]
+    cvtss2sd xmm6, [cam_dist]          ; xmm4-6: cam_dist
+
+    mulss   xmm4, xmm2          ; xmm4: dist * sin(phi)
+    mulss   xmm4, xmm1          ; xmm4: x = dist * sin(phi) * cos(theta)
+    mulss   xmm5, xmm3          ; xmm5: y = dist * cos(phi)
+    mulss   xmm6, xmm0          ; xmm6: dist * sin(theta)
+    mulss   xmm6, xmm2          ; xmm6: z = dist * sin(phi) * sin(theta)
+
+    ; TODO: fix this stuff. This seems to work, theta is
+    ; updating, and xmm4,5,6 seem to contain the correct
+    ; values, but moving them to v4_lookfrom doesn't seem
+    ; to be effective.
+    ;mov     eax, 3
+    ;movss   xmm2, xmm4
+    ;movss   xmm1, xmm5
+    ;movss   xmm0, xmm6
+    ;mov     rdi, debug_msg
+    ;call    printf
+
+    movss   [v4_lookfrom+0x00], xmm4
+    movss   [v4_lookfrom+0x04], xmm5
+    movss   [v4_lookfrom+0x08], xmm6
+
+    mov     eax, 3
+    movss   xmm2, [v4_lookfrom+0x00]
+    movss   xmm1, [v4_lookfrom+0x04]
+    movss   xmm0, [v4_lookfrom+0x08]
+    mov     rdi, debug_msg
+    call    printf
+
 ;===========================================================
 ; RENDER PROCEDURE
 ;
@@ -246,7 +306,7 @@ loop_begin:
     ;   xmm14: pixel center at uv (0,0)
     ;   xmm15: look from, camera origin
     lea     rdi, [v4_lookfrom]
-    movaps  xmm10, [rdi]        ; xmm10 has lookfrom
+    movaps  xmm15, [rdi]        ; xmm15 has lookfrom
 
     ; Calculate camera basis vectors:
     ;   xmm8  <- u = norm(cross(up, w))
@@ -268,7 +328,7 @@ loop_begin:
 
     movaps  xmm9, xmm10
     movaps  xmm1, xmm8
-    v3cross xmm9, xmm1          ; xmm0: basis v
+    v3cross xmm9, xmm1          ; xmm9: basis v
 
     ; viewport_u = scale(viewport_w, basis_u)
     ; viewport_v = scale(-viewport_h, basis_v)
@@ -318,59 +378,108 @@ loop_begin:
 ; For now, we assume SSE 4.2 suppport. Once we get to deeper
 ; optimizations, we should make versions of this loop for
 ; sse 4.2, avx, avx2, and avx512
+;
+; Here's a good scheme which is nicely scaleable to
+; different instruction sets:
+;
+; Cube mins/maxes are packed into stack memory, and the
+; blah blah you get the picture. Let's try to do shitty
+; first then work with simd shit.
 
-    mov     rdi, 0              ; rdi is the pixel counter and must be stable
+    xor     edi, edi             ; edi: pixel counter
 pixel_loop_begin:
-    ; Determine pixel position and color
+    cmp     rdi, 1024
+    jg      dbg
+    jmp     nodbg
+dbg:
+    nop
+nodbg:
+    xor     edx, edx
+    mov     eax, edi
+    div     dword [i_pixels_w]
+    mov     esi, edx            ; esi: x = (i % w)
+    mov     ecx, eax            ; ecx: y = (i / w)
 
-    ; TODO: In both of these division operations, we are
-    ; moving the result we want into the register we want
-    ; manually. Is there a better way to do this with less
-    ; instructions?
-    mov     rax, rdi
-    mov     rsi, pixels_w
-    mov     rdx, 0
-    div     rsi
-    mov     rsi, rdx            ; x = (rdi % w)
+    cvtsi2ss xmm0, esi
+    cvtsi2ss xmm1, ecx
+    shufps  xmm0, xmm0, 0       ; xmm0: x
+    shufps  xmm1, xmm1, 0       ; xmm1: y
+    mulps   xmm0, xmm12         ; xmm0: y * pixel_delta_u
+    mulps   xmm1, xmm13         ; xmm1: x * pixel_delta_v
+    addps   xmm0, xmm1
+    addps   xmm0, xmm14         ; xmm0: pixel center
+    subps   xmm0, xmm15         ; xmm0: ray direction
+    v3norm  xmm0
+    lea     r8, [abs_mask]
+    andps   xmm0, [r8]          ; xmm0: absolute value for color
+    lea     r8, [v4_255]
+    mulps   xmm0, [r8]          ; xmm0 scaled by 255
 
-    mov     rax, rdi
-    mov     rcx, pixels_w
-    div     rcx
-    mov     rcx, rax            ; y = (rdi / w)
+    sub     rsp, 16
+    movaps  [rsp], xmm0
+    cvttss2si r8d, [rsp+0x00]
+    cvttss2si r9d, [rsp+0x04]
+    cvttss2si r10d, [rsp+0x08]
+    cvttss2si r11d, [rsp+0x0C]
+    add     rsp, 16
 
-    ; When we get to testing AABB intersection:
+    ;cmp     r8d, 512
+    ;jge     exit
+    ;cmp     r9d, 512
+    ;jge     exit
+    ;cmp     r10d, 512
+    ;jge     exit
+    ;cmp     r11d, 512
+    ;jge     exit
+    
+    lea     r12, [pixels+rdi*4]  ; r12: pixel address
+    mov     byte [r12+0x00], r10b ; r
+    mov     byte [r12+0x01], r9b; g
+    mov     byte [r12+0x02], r8b; b
+    mov     byte [r12+0x03], 0xff ; a
+
+    ; Branchless ray/bounding box intersection:
     ;   (https://tavianator.com/2022/ray_box_boundary.html)
 
-    add     rsp, 4              ; reserve 4 bytes for color
-    mov     byte [rsp+0], 0xff
-    mov     byte [rsp+1], sil
-    mov     byte [rsp+2], cl
-    mov     byte [rsp+3], 0xff
-    mov     ebx, [rsp]          ; ebx now has color
-    sub     rsp, 4              ; free color bits
+    ; Define gradient color
+    ;add     rsp, 4              ; reserve 4 bytes for color
+    ;mov     byte [rsp+0], 0xff
+    ;mov     byte [rsp+1], sil
+    ;mov     byte [rsp+2], cl
+    ;mov     byte [rsp+3], 0xff
+    ;mov     ebx, [rsp]          ; ebx now has color
+    ;sub     rsp, 4              ; free color bits
 
-    ; Write color to position
-    xor     rax, rax            ; clear rax for mul
-    mov     eax, pixels_w
-    mul     rcx
-    mov     rcx, rax
-    add     rcx, rsi            ; rcx is now (y * width + x)
-    mov     rax, 4
-    mul     rcx                 ; multiply r10 by 4 color channels
-    lea     r9, [pixels+rax]    ; r9 now pointing to screen pixel
+    ; Write gradient color to position
+    ;xor     rax, rax            ; clear rax for mul
+    ;mov     eax, pixels_w
+    ;mul     rcx
+    ;mov     rcx, rax
+    ;add     rcx, rsi            ; rcx is now (y * width + x)
+    ;mov     rax, 4
+    ;mul     rcx                 ; multiply r10 by 4 color channels
+    ;lea     r9, [pixels+rax]    ; r9 now pointing to screen pixel
+    ;mov     dword [r9], ebx     ; Write pixel
 
-    mov     dword [r9], ebx     ; Write pixel
+    ;lea     r12, [pixels+rdi*4]  ; r12: pixel address
+    ;mov     dword [r12], ebx     ; Write pixel
 
-    inc     rdi
-    cmp     rdi, pixels_len
+    inc     edi
+    cmp     edi, pixels_len
     jl      pixel_loop_begin
 
-    ; Update pixels
-    mov     edx, 0xffff0000
-    mov     rsi, 50
-    mov     rdi, [player_x]
-    call    put_color
-    inc     [player_x]
+
+    ; End of loop
+    ;inc     rdi
+    ;cmp     rdi, pixels_len
+    ;jl      pixel_y_begin
+
+    ; Draw "player" pixel
+    ;mov     edx, 0xffff0000
+    ;mov     rsi, 50
+    ;mov     rdi, [player_x]
+    ;call    put_color
+    ;inc     [player_x]
 
     ; Update GL data
     push    0
@@ -530,25 +639,37 @@ section '.data' writeable align 16
 
 msglen     = 4096
 ; WARNING: v4_pixels__ below needs to match these
-pixels_w   = 128
-pixels_h   = 128
+pixels_w   = 256
+pixels_h   = 256
 pixels_len = pixels_w * pixels_h
 
 msg         rd msglen           ; general purpose string buffer
 window_name db 'Cube Games', 0
 
+debug_msg   db 'cam %f, %f, %f', 10, 0
+
 ; game state
 player_x dq 0
 
 ; render data
-pixels       rb pixels_len * 4
-clear_r      dd 0.3
-clear_g      dd 0.1
-clear_b      dd 0.2
-clear_a      dd 1.0
+align 16
+pixels            rb pixels_len * 4
+clear_r           dd 0.3
+clear_g           dd 0.1
+clear_b           dd 0.2
+clear_a           dd 1.0
+i_pixels_w        dd 256
+cam_theta         dd 1.1
+cam_phi           dd 1.1
+cam_theta_per_sec dd 0.01
+cam_dist          dd 1.0
 ; Aligned and quadrupled for use in xmm registers
 align 16
 v4_half       dd 0.5, 0.5, 0.5, 0.5
+align 16
+v4_four       dd 4.0, 4.0, 4.0, 4.0
+align 16
+v4_255        dd 255.0, 255.0, 255.0, 255.0
 align 16
 v4_focal_len  dd 1.0
 align 16
@@ -558,13 +679,15 @@ v4_viewport_h dd -2.0, -2.0, -2.0, -2.0
 align 16
 v4_viewport_w dd 2.0, 2.0, 2.0, 2.0
 align 16
-v4_pixels_w   dd 128.0, 128.0, 128.0, 128.0
+v4_pixels_w   dd 256.0, 256.0, 256.0, 256.0
 align 16
-v4_pixels_h   dd 128.0, 128.0, 128.0, 128.0
+v4_pixels_h   dd 256.0, 256.0, 256.0, 256.0
 align 16
 v4_lookfrom   dd 0.0, 0.0, 0.0, 0.0
 align 16
-v4_lookat     dd 0.0, 0.0, -1.0, 0.0
+v4_lookat     dd 0.0, 0.0, 1.0, 0.0
+align 16
+abs_mask      dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
 
 ; gl data
 glfw_window  rq 1

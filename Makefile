@@ -8,7 +8,7 @@ bin/cube_games: build/main.o build/gl3w.o
 	mkdir -p bin
 	ld -o bin/cube_games --dynamic-linker /lib64/ld-linux-x86-64.so.2 \
 		build/main.o build/gl3w.o \
-		-lc -lglfw -lGL -lX11 -lpthread -lXrandr -lXi -ldl
+		-lc -lm -lglfw -lGL -lX11 -lpthread -lXrandr -lXi -ldl
 
 run: bin/cube_games
 	bin/cube_games
