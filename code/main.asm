@@ -291,7 +291,7 @@ loop_begin:
     ;   xmm13: pixel delta v
     ;   xmm14: pixel center at uv (0,0)
     ;   xmm15: look from, camera origin
-    movaps  xmm15, dqword [v4_lookfrom]        ; xmm15 has lookfrom
+    movaps  xmm15, dqword [v4_lookfrom] ; xmm15 has lookfrom
 
     ; Calculate camera basis vectors:
     ;   xmm8  <- u = norm(cross(up, w))
@@ -409,33 +409,69 @@ pixel_loop_begin:
     ;
     ; TODO: Inigo with the clutch:
     ;   (https://iquilezles.org/articles/intersectors/)
-    ;
-    ; box_size: centered at origin, transform origin and dir accordingly
-    ; vec3 r_inv = 1.0 / r_dir ;
-    ; vec3 n = r_inv * r_origin ;
+    ; Box size centered at origin, transform origin and dir accordingly
+
+    ; vec3 r_inv = 1.0 / r_dir
+    movaps  xmm0, xmm11         ; calculate inverse of ray direction
+    movaps  xmm10, dqword [v4_one]
+    divps   xmm10, xmm0         ; xmm10 = ray inverse direction. apparently, a
+                                ; divide by 0 (=infinity) still works here.
+
+    ; vec3 n = r_inv * r_origin
+    movaps  xmm9, xmm10         ; xmm9: ray inverse
+    mulps   xmm9, xmm15         ; xmm9: n
+    xorps   xmm9, dqword [v4_flip] ; xmm9: -n
+
     ; vec3 k = abs(r_inv) * box_size
+    movaps  xmm8, xmm10         ; xmm8: ray inverse
+    andps   xmm8, dqword [abs_mask] ; xmm8: abs(ray inverse)
+    mulps   xmm8, dqword [v4_boxmax] ; xmm8: k
+
     ; vec3 t1 = -n - k
     ; vec3 t2 = -n + k
+    movaps  xmm7, xmm8          ; xmm7: k
+    addps   xmm8, xmm9          ; xmm8: t2
+    subps   xmm9, xmm7          ; xmm9: t1
+    insertps xmm8, [v4_inf], 0x30
+    insertps xmm9, [v4_negative_inf], 0x30
+
     ; float t_near = max(max(t1.x, t1.y), t1.z);
     ; float t_far = min(min(t2.x, t2.y), t2.z);
-    ;
-    ; if(t_near > t_far || t_far < 0.0)
-    ;     intersection = false;
-    ;
+    movaps  xmm7, xmm9
+    movshdup xmm6, xmm9
+    maxps   xmm7, xmm6
+    movhlps xmm6, xmm7
+    maxps   xmm7, xmm6          ; xmm7: t_near
+
+    movaps  xmm6, xmm8
+    movshdup xmm5, xmm8
+    minps   xmm6, xmm5
+    movhlps xmm5, xmm6
+    minps   xmm6, xmm5          ; xmm6: t_far
+
+
     ; Alright, make sense of this shit.
     ; normal = (t_near > 0.0) ? step(vec3(t_near), t1)) : step(t2, vec3(t_far)));
     ; normal *= -sign(r_dir);
     ; point = vec2(t_near, t_far);
-
+    ;;;
 
     ; If we didn't intersect, get color from ray direction
     andps   xmm11, dqword [abs_mask] ; xmm11: absolute value for color
     mulps   xmm11, dqword [v4_255] ; xmm11 scaled by 255 for rgb space
+
+    ; if(t_near > t_far || t_far < 0.0)
+    ;     intersection = false;
+    ucomiss xmm7, xmm6
     jb      intersect
+    ; The below correspondes to (t_far < 0.0)
+    ;ucomiss xmm6, dword [v4_zero]
+    ;jb      intersect
+
     jmp     pixel_loop_end
 intersect:
-    mulps   xmm11, dqword [v4_viewport_w] ; causing an overflow makes for a
-                                          ; really cool pattern
+    mulps   xmm11, dqword [v4_two] ; causing an overflow makes for a
+                                   ; really cool pattern
 pixel_loop_end:
     cvtps2dq xmm11, xmm11       ; convert to dword integers
     packusdw xmm11, xmm11       ; pack into 16bit words
@@ -601,8 +637,8 @@ section '.data' writeable align 16
 
 msglen     = 4096
 ; WARNING: v4_pixels__ below needs to match these
-pixels_w   = 256
-pixels_h   = 256
+pixels_w   = 2048
+pixels_h   = 2048
 pixels_len = pixels_w * pixels_h
 
 msg         rd msglen           ; general purpose string buffer
@@ -625,13 +661,16 @@ cam_dist          dd 2.0
 ; Aligned and quadrupled for use in xmm registers
 align 16
 ; useful numbers
-v4_inf        dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
-;v4_inf        dd 100000.0, 100000.0, 100000.0, 100000.0
-v4_half       dd 0.5, 0.5, 0.5, 0.5
-v4_one        dd 1.0, 1.0, 1.0, 1.0
-v4_four       dd 4.0, 4.0, 4.0, 4.0
-v4_255        dd 255.0, 255.0, 255.0, 255.0
-abs_mask      dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
+v4_inf          dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
+v4_negative_inf dd 0xFF800000, 0xFF800000, 0xFF800000, 0xFF800000
+v4_flip         dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
+v4_zero         dd 0.0, 0.0, 0.0, 0.0
+v4_half         dd 0.5, 0.5, 0.5, 0.5
+v4_one          dd 1.0, 1.0, 1.0, 1.0
+v4_two          dd 2.0, 2.0, 2.0, 2.0
+v4_four         dd 4.0, 4.0, 4.0, 4.0
+v4_255          dd 255.0, 255.0, 255.0, 255.0
+abs_mask        dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
 ; constants
 v4_lookfrom   dd 0.0, 0.0, 0.0, 0.0
 v4_lookat     dd 0.0, 0.0, 0.0, 0.0
@@ -639,10 +678,11 @@ v4_upvector   dd 0.0, 1.0, 0.0, 0.0
 v4_focal_len  dd 2.0, 2.0, 2.0, 2.0
 v4_viewport_h dd -2.5, -2.5, -2.5, -2.5
 v4_viewport_w dd 2.5, 2.5, 2.5, 2.5
-v4_pixels_w   dd 256.0, 256.0, 256.0, 256.0
-v4_pixels_h   dd 256.0, 256.0, 256.0, 256.0
+v4_pixels_w   dd 2048.0, 2048.0, 2048.0, 2048.0
+v4_pixels_h   dd 2048.0, 2048.0, 2048.0, 2048.0
 v4_boxmin     dd -0.5, -0.5, -0.5, -0.5
 v4_boxmax     dd 0.5, 0.5, 0.5, 0.5
+v4_negative_one dd -1.0, -1,0, -1.0, -1.0
 
 ; gl data
 glfw_window  rq 1
