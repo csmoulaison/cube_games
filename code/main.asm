@@ -1,9 +1,8 @@
-;===========================================================
-; TODOS
-; - Tracing against AABBs
-; - Arbitary voxel grid roation (cam/viewport transform)
-; - Multithreading with sys_clone call
-; - SIMD instructions
+;= TODOS ===================================================
+; * Tracing against AABBs
+; * Arbitary voxel grid roation (cam/viewport transform)
+; * Multithreading with sys_clone call
+; * SIMD instructions
 ;===========================================================
 
 format ELF64
@@ -13,6 +12,7 @@ section '.text' executable
 ;===========================================================
 
 include 'vec3.asm'
+include 'rand.asm'
 
 ; When linking with gl3w, we ge an undefined reference to
 ; __dso_handle. This shit is a little too esoteric for my
@@ -196,8 +196,7 @@ _start:
     mov     edi, r13d
     call    glDeleteShader 
 
-;===========================================================
-; MAIN LOOP:
+;= MAIN LOOP ===============================================
 ; This runs repeatedly until the program wants to exit
 ;===========================================================
 loop_begin:
@@ -248,9 +247,7 @@ loop_begin:
     ;mov     rdi, debug_msg
     ;call    printf
 
-;===========================================================
-; RENDER PROCEDURE
-;
+;= RENDER PROCEDURE ========================================
 ; At a high level, our goal is such:
 ; for each pixel
 ;    map pixel to a viewport position
@@ -344,10 +341,10 @@ loop_begin:
     subps   xmm14, xmm9         ; xmm14: viewport_origin
 
     ; pixel00 = viewport_origin + (0.5 * (pixel_delta_u + pixel_delta_v));
-    movaps  xmm1, xmm12         ; xmm1: pixel_delta_u
-    addps   xmm1, xmm13         ; xmm1: pd_u + pd_v
-    mulps   xmm1, xmm0          ; xmm1: 0.5 * (pd_u + pd_v)
-    addps   xmm14, xmm1         ; xmm14: pixel00
+    ;movaps  xmm1, xmm12         ; xmm1: pixel_delta_u
+    ;addps   xmm1, xmm13         ; xmm1: pd_u + pd_v
+    ;mulps   xmm1, xmm0          ; xmm1: 0.5 * (pd_u + pd_v)
+    ;addps   xmm14, xmm1         ; xmm14: pixel00
 
 ; We've gathered the values listed above in xmm12-15 and
 ; now it's time to do the tight pixel loop.
@@ -394,7 +391,13 @@ pixel_loop_begin:
     ;
     ; TODO: sample a random point within the viewport pixel
     cvtsi2ss xmm11, esi         ; xmm11 will become ray direction
+    frand_unsigned xmm10
+    addps   xmm11, xmm10
+
     cvtsi2ss xmm1, ecx
+    frand_unsigned xmm10
+    addps   xmm1, xmm10
+
     shufps  xmm11, xmm11, 0     ; xmm11: x
     shufps  xmm1, xmm1, 0       ; xmm1: y
     mulps   xmm11, xmm12        ; xmm11: y * pixel_delta_u
@@ -404,7 +407,23 @@ pixel_loop_begin:
     subps   xmm11, xmm15        ; xmm11: ray direction
     v3norm  xmm11               ; normalize ray direction
 
-    ; Next, we determine whether the ray intersects with an
+    movaps  xmm10, xmm15        ; xmm10: ray origin from camera position
+    movaps  xmm9, dqword [v4_one] ; xmm9: color attenuation starts at v4(1.0)
+    mov     r8, 0
+
+;= TRACE RAY ===============================================
+; We return here on every bounce, with the following
+; registers remaining stable and updated on every bounce.
+;   xmm11: current ray direction
+;   xmm10: current ray origin
+;   xmm9:  current color attenuation
+;   r8:    bounce iteration
+;===========================================================
+trace_ray:
+    cmp     r8, 50
+    je      exit
+    
+    ; We determine whether the ray intersects with an
     ; axis aligned box centered at the origin.
     ;
     ; TODO: Inigo with the clutch:
@@ -413,66 +432,104 @@ pixel_loop_begin:
 
     ; vec3 r_inv = 1.0 / r_dir
     movaps  xmm0, xmm11         ; calculate inverse of ray direction
-    movaps  xmm10, dqword [v4_one]
-    divps   xmm10, xmm0         ; xmm10 = ray inverse direction. apparently, a
+    movaps  xmm8, dqword [v4_one]
+    divps   xmm8, xmm0          ; xmm8 = ray inverse direction. apparently, a
                                 ; divide by 0 (=infinity) still works here.
     ; vec3 n = r_inv * r_origin
-    movaps  xmm9, xmm10         ; xmm9: ray inverse
-    mulps   xmm9, xmm15         ; xmm9: n
-    xorps   xmm9, dqword [v4_flip] ; xmm9: -n
+    movaps  xmm7, xmm8          ; xmm7: ray inverse
+    mulps   xmm7, xmm10         ; xmm7: n
+    xorps   xmm7, dqword [v4_sign_mask] ; xmm7: -n
 
     ; vec3 k = abs(r_inv) * box_size
-    movaps  xmm8, xmm10         ; xmm8: ray inverse
-    andps   xmm8, dqword [abs_mask] ; xmm8: abs(ray inverse)
-    mulps   xmm8, dqword [v4_boxmax] ; xmm8: k
+    movaps  xmm6, xmm8          ; xmm6: ray inverse
+    andps   xmm6, dqword [abs_mask] ; xmm6: abs(ray inverse)
+    mulps   xmm6, dqword [v4_boxmax] ; xmm6: k
 
     ; vec3 t1 = -n - k
     ; vec3 t2 = -n + k
-    movaps  xmm7, xmm8          ; xmm7: k
-    addps   xmm8, xmm9          ; xmm8: t2
-    subps   xmm9, xmm7          ; xmm9: t1
-    insertps xmm8, [v4_inf], 0x30
-    insertps xmm9, [v4_negative_inf], 0x30
+    movaps  xmm5, xmm6          ; xmm5: k
+    addps   xmm6, xmm7          ; xmm6: t2
+    subps   xmm7, xmm5          ; xmm7: t1
+    insertps xmm6, [v4_inf], 0x30
+    insertps xmm7, [v4_negative_inf], 0x30
 
     ; float t_near = max(max(t1.x, t1.y), t1.z);
     ; float t_far = min(min(t2.x, t2.y), t2.z);
-    movaps  xmm7, xmm9
-    movshdup xmm6, xmm9
-    maxps   xmm7, xmm6
-    movhlps xmm6, xmm7
-    maxps   xmm7, xmm6          ; xmm7: t_near
+    movaps  xmm5, xmm7
+    movshdup xmm4, xmm7
+    maxps   xmm5, xmm4
+    movhlps xmm4, xmm5
+    maxps   xmm5, xmm4          ; xmm5: t_near
 
-    movaps  xmm6, xmm8
-    movshdup xmm5, xmm8
-    minps   xmm6, xmm5
-    movhlps xmm5, xmm6
-    minps   xmm6, xmm5          ; xmm6: t_far
+    movaps  xmm4, xmm6
+    movshdup xmm3, xmm6
+    minps   xmm4, xmm3
+    movhlps xmm3, xmm4
+    minps   xmm4, xmm3          ; xmm4: t_far
 
-    ; if(t_near > t_far || t_far < 0.0) no_intersect
-    ucomiss xmm7, xmm6
-    jb      intersect
-    ; The below correspondes to (t_far < 0.0)
-    ;ucomiss xmm6, dword [v4_zero]
-    ;jb      intersect
+    ; if(t_near < t_far) intersect
+    ucomiss xmm4, xmm5
+    jb      calculate_pixel_color
 
-    ; If we didn't intersect, get color from ray direction
-    jmp     pixel_loop_end
-intersect:
+    ; Attenuate color
+    mulps   xmm9, dqword [v4_albedo]
+
+    ; Bounce/trace another ray unless we are at max depth
+    inc     r8
+    cmp     r8, bounce_max
+    jg      calculate_pixel_color
+
     ; Get normal of intersection
-    movss   xmm5, xmm7
-    shufps  xmm5, xmm5, 0       ; splat t_near to all 4 lanes
-    cmpps   xmm5, xmm9, 0
-    movmskps eax, xmm5
-    shl     eax, 4
-    movaps   xmm11, dqword [v4_normals+eax]
+    movaps  xmm8, xmm7          ; xmm8: t1
+    movss   xmm3, xmm5          ; xmm3: t_near
+    shufps  xmm3, xmm3, 0       ; splat t_near to xmm3
+    cmpps   xmm8, xmm3, 5
+    andps   xmm8, dqword [v4_one]
+    ;cmpps   xmm3, xmm7, 0
+    ;movmskps eax, xmm3          ; eax now contains bitmask ### = zyx
+    ;shl     eax, 4              ; multiply by 16 to index lookup table
+    ;movaps  xmm2, dqword [v4_normals+eax] ; xmm2: normal from lookup table
+    
+    ; Multiply by -sign of ray direction
+    movaps  xmm0, xmm11
+    andps   xmm0, dqword [v4_sign_mask]
+    xorps   xmm0, dqword [v4_sign_mask]
+    xorps   xmm8, xmm0
 
-pixel_loop_end:
+    ; Calculate diffuse reflection
+    ; usable xmm registers: xmm1, xmm2, xmm3, xmm4, xmm6, xmm7
+    ;pxor    xmm7, xmm7
+    frand_normal xmm7
+    frand_normal xmm6
+    shufps  xmm6, xmm6, 0
+    frand_normal xmm4
+    shufps  xmm4, xmm4, 0
+    blendps xmm7, xmm6, 0010b
+    blendps xmm7, xmm4, 0100b
+    v3norm  xmm7
+    addps   xmm7, xmm8          ; xmm7 is the new direction
+    v3norm  xmm7
+
+    ; Calculate hit position
+    ; r_origin + r_dir * t_near;
+    mulps   xmm5, xmm11         ; xmm5: r_dir * t_near
+    addps   xmm10, xmm5         ; xmm10: hit position, new ray origin
+    ;movaps  xmm11, xmm8         ; new ray direction is the normal for now
+    movaps  xmm11, xmm7         ; new ray direction the lambertian reflection
+    mulps   xmm8, dqword [v4_eps]
+    addps   xmm10, xmm8         ; add small amount of normal to ray origin
+    jmp     trace_ray
+
+calculate_pixel_color:
+    ; TODO: multiply attenuation by sky (ray) color
     andps   xmm11, dqword [abs_mask] ; xmm11: absolute value for color
+    mulps   xmm11, xmm9         ; attenuate color from bounces
+
     mulps   xmm11, dqword [v4_255] ; xmm11 scaled by 255 for rgb space
     cvtps2dq xmm11, xmm11       ; convert to dword integers
     packusdw xmm11, xmm11       ; pack into 16bit words
     packuswb xmm11, xmm11       ; pack into bytes
-    movd     dword [pixels+rdi*4], xmm11 ; move to pixel location
+    movd    dword [pixels+rdi*4], xmm11 ; move to pixel location
     inc     edi
     cmp     edi, pixels_len
     jl      pixel_loop_begin
@@ -541,7 +598,7 @@ exit:
     xor     rdi, rdi
     syscall 
 
-;===========================================================
+;= COMPILE SHADER ==========================================
 ; Compiles a shader for OpenGL.
 ;
 ; input
@@ -599,7 +656,7 @@ compile_shader_success:
     add     rsp, 40
     ret
 
-;===========================================================
+;= PUT COLOR ===============================================
 ; Writes an rgb value to the pixels buffer.
 ;
 ; NOTE: This will likely be inlined as part of the render
@@ -633,9 +690,10 @@ section '.data' writeable align 16
 
 msglen     = 4096
 ; WARNING: v4_pixels__ below needs to match these
-pixels_w   = 1024
-pixels_h   = 1024
+pixels_w   = 128
+pixels_h   = 128
 pixels_len = pixels_w * pixels_h
+bounce_max = 10
 
 msg         rd msglen           ; general purpose string buffer
 window_name db 'Empedocles Renderer', 0
@@ -645,13 +703,14 @@ debug_msg   db 'cam %f, %f, %f', 10, 0
 ; render data
 align 16
 pixels            rb pixels_len * 4
+rand_seed         dd 10231284
 clear_r           dd 0.3
 clear_g           dd 0.1
 clear_b           dd 0.2
 clear_a           dd 1.0
 i_pixels_w        dd pixels_w
-cam_theta         dd 1.1
-cam_phi           dd -2.1
+cam_theta         dd -1.1
+cam_phi           dd 2.1
 cam_theta_per_sec dd 0.01
 cam_dist          dd 2.0
 ; Aligned and quadrupled for use in xmm registers
@@ -659,20 +718,23 @@ align 16
 ; useful numbers
 v4_inf          dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
 v4_negative_inf dd 0xFF800000, 0xFF800000, 0xFF800000, 0xFF800000
-v4_flip         dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
+v4_sign_mask    dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
 v4_zero         dd 0.0, 0.0, 0.0, 0.0
+v4_eps          dd 0.1, 0.1, 0.1, 0.1
 v4_half         dd 0.5, 0.5, 0.5, 0.5
 v4_one          dd 1.0, 1.0, 1.0, 1.0
 v4_two          dd 2.0, 2.0, 2.0, 2.0
+v4_three        dd 3.0, 3.0, 3.0, 3.0
 v4_four         dd 4.0, 4.0, 4.0, 4.0
 v4_255          dd 255.0, 255.0, 255.0, 255.0
 abs_mask        dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
 v4_normals:
-    dd 0.0, 0.0, 0.0, 1.0 ; 000
-    dd 1.0, 0.0, 0.0, 1.0 ; 001
-    dd 0.0, 1.0, 0.0, 1.0 ; 010
-    dd 0.0, 0.0, 0.0, 1.0 ; 011
-    dd 0.0, 0.0, 1.0, 1.0 ; 100
+    dd 0.0, 0.0, 0.0, 0.0 ; 000
+    dd 0.0, 0.0, 1.0, 0.0 ; 001
+    dd 0.0, 1.0, 0.0, 0.0 ; 010
+    dd 0.0, 0.0, 0.0, 0.0 ; 011
+    dd 1.0, 0.0, 0.0, 0.0 ; 100
+v4i_zero        dd 0, 0, 0, 0
 
 ; constants
 v4_lookfrom   dd 0.0, 0.0, 0.0, 0.0
@@ -681,10 +743,11 @@ v4_upvector   dd 0.0, 1.0, 0.0, 0.0
 v4_focal_len  dd 2.0, 2.0, 2.0, 2.0
 v4_viewport_h dd -2.5, -2.5, -2.5, -2.5
 v4_viewport_w dd 2.5, 2.5, 2.5, 2.5
-v4_pixels_w   dd 1024.0, 1024.0, 1024.0, 1024.0
-v4_pixels_h   dd 1024.0, 1024.0, 1024.0, 1024.0
+v4_pixels_w   dd 128.0, 128.0, 128.0, 128.0
+v4_pixels_h   dd 128.0, 128.0, 128.0, 128.0
 v4_boxmin     dd -0.5, -0.5, -0.5, -0.5
-v4_boxmax     dd 0.5, 0.5, 0.5, 0.5
+v4_boxmax     dd 0.5, 0.5, 0.5, 0.43
+v4_albedo     dd 0.66, 0.66, 0.66, 0.66
 v4_negative_one dd -1.0, -1,0, -1.0, -1.0
 
 ; gl data
