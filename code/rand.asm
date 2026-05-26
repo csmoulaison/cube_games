@@ -37,5 +37,5 @@ macro frand_normal xmm_result {
     addss xmm_result, xmm0
     frand_unsigned xmm0
     addss xmm_result, xmm0
-    subss xmm0, [v4_two]
+    subss xmm_result, [v4_two]
 }

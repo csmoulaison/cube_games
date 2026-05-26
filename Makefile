@@ -1,7 +1,7 @@
 MAKEFLAGS += -r
 GEN_DIR = code/generation
 SHADERS = code/shaders/screen.vert code/shaders/screen.frag
-INCLUDED = code/vec3.asm
+INCLUDED = code/vec3.asm code/rand.asm
 
 # Root targets
 bin/empedocles: build/main.o build/gl3w.o

@@ -351,7 +351,7 @@ loop_begin:
 ;
 ; For now, we assume SSE 4.2 suppport. Once we get to deeper
 ; optimizations, we should make versions of this loop for
-; sse 4.2, avx, avx2, and avx512
+; sse 4.2, avx, avx2, and avx256
 ;
 ; Here's a good scheme which is nicely scaleable to
 ; different instruction sets:
@@ -405,7 +405,7 @@ pixel_loop_begin:
     addps   xmm11, xmm1
     addps   xmm11, xmm14        ; xmm11: pixel center
     subps   xmm11, xmm15        ; xmm11: ray direction
-    v3norm  xmm11               ; normalize ray direction
+    ;v3norm  xmm11               ; normalize ray direction
 
     movaps  xmm10, xmm15        ; xmm10: ray origin from camera position
     movaps  xmm9, dqword [v4_one] ; xmm9: color attenuation starts at v4(1.0)
@@ -461,6 +461,9 @@ trace_ray:
     movhlps xmm4, xmm5
     maxps   xmm5, xmm4          ; xmm5: t_near
 
+    ucomiss xmm5, [v4_eps]
+    jb      calculate_pixel_color
+
     movaps  xmm4, xmm6
     movshdup xmm3, xmm6
     minps   xmm4, xmm3
@@ -481,8 +484,8 @@ trace_ray:
 
     ; Get normal of intersection
     movaps  xmm8, xmm7          ; xmm8: t1
-    movss   xmm3, xmm5          ; xmm3: t_near
-    shufps  xmm3, xmm3, 0       ; splat t_near to xmm3
+    shufps  xmm5, xmm5, 0       ; splat t_near to all lanes
+    movaps  xmm3, xmm5          ; xmm3: splatted t_near
     cmpps   xmm8, xmm3, 5
     andps   xmm8, dqword [v4_one]
     ;cmpps   xmm3, xmm7, 0
@@ -497,6 +500,21 @@ trace_ray:
     xorps   xmm8, xmm0
 
     ; Calculate diffuse reflection
+
+    ; TODO: I think this is where our issue is currently.
+    ; The normal seems to be correct, and its just the
+    ; process of calculating a lambertian reflection about
+    ; that normal that is going wrong for one sign of the
+    ; axes.
+    ;
+    ; I think the next step is probably to do some actual
+    ; dumping of data from these frand_normals to see if the
+    ; resulting numbers are distributed how we want.
+    ;
+    ; We can also debug and see if the blendps lanes are
+    ; correct. (though I think I played around with it
+    ; enough to determine that they are.
+
     ; usable xmm registers: xmm1, xmm2, xmm3, xmm4, xmm6, xmm7
     ;pxor    xmm7, xmm7
     frand_normal xmm7
@@ -508,28 +526,28 @@ trace_ray:
     blendps xmm7, xmm4, 0100b
     v3norm  xmm7
     addps   xmm7, xmm8          ; xmm7 is the new direction
-    v3norm  xmm7
+    ;v3norm  xmm7
 
     ; Calculate hit position
     ; r_origin + r_dir * t_near;
     mulps   xmm5, xmm11         ; xmm5: r_dir * t_near
     addps   xmm10, xmm5         ; xmm10: hit position, new ray origin
-    ;movaps  xmm11, xmm8         ; new ray direction is the normal for now
     movaps  xmm11, xmm7         ; new ray direction the lambertian reflection
-    mulps   xmm8, dqword [v4_eps]
-    addps   xmm10, xmm8         ; add small amount of normal to ray origin
+    ;movaps  xmm11, xmm8         ; new ray direction is the normal for now
     jmp     trace_ray
 
 calculate_pixel_color:
     ; TODO: multiply attenuation by sky (ray) color
-    andps   xmm11, dqword [abs_mask] ; xmm11: absolute value for color
-    mulps   xmm11, xmm9         ; attenuate color from bounces
+    movaps  xmm8, xmm11
+    v3norm  xmm8
+    andps   xmm8, dqword [abs_mask] ; xmm8: absolute value for color
+    mulps   xmm8, xmm9         ; attenuate color from bounces
 
-    mulps   xmm11, dqword [v4_255] ; xmm11 scaled by 255 for rgb space
-    cvtps2dq xmm11, xmm11       ; convert to dword integers
-    packusdw xmm11, xmm11       ; pack into 16bit words
-    packuswb xmm11, xmm11       ; pack into bytes
-    movd    dword [pixels+rdi*4], xmm11 ; move to pixel location
+    mulps   xmm8, dqword [v4_255] ; xmm8 scaled by 255 for rgb space
+    cvtps2dq xmm8, xmm8       ; convert to dword integers
+    packusdw xmm8, xmm8       ; pack into 16bit words
+    packuswb xmm8, xmm8       ; pack into bytes
+    movd    dword [pixels+rdi*4], xmm8 ; move to pixel location
     inc     edi
     cmp     edi, pixels_len
     jl      pixel_loop_begin
@@ -690,8 +708,8 @@ section '.data' writeable align 16
 
 msglen     = 4096
 ; WARNING: v4_pixels__ below needs to match these
-pixels_w   = 128
-pixels_h   = 128
+pixels_w   = 256
+pixels_h   = 256
 pixels_len = pixels_w * pixels_h
 bounce_max = 10
 
@@ -720,7 +738,7 @@ v4_inf          dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
 v4_negative_inf dd 0xFF800000, 0xFF800000, 0xFF800000, 0xFF800000
 v4_sign_mask    dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
 v4_zero         dd 0.0, 0.0, 0.0, 0.0
-v4_eps          dd 0.1, 0.1, 0.1, 0.1
+v4_eps          dd 0.02, 0.02, 0.02, 0.02
 v4_half         dd 0.5, 0.5, 0.5, 0.5
 v4_one          dd 1.0, 1.0, 1.0, 1.0
 v4_two          dd 2.0, 2.0, 2.0, 2.0
@@ -743,11 +761,11 @@ v4_upvector   dd 0.0, 1.0, 0.0, 0.0
 v4_focal_len  dd 2.0, 2.0, 2.0, 2.0
 v4_viewport_h dd -2.5, -2.5, -2.5, -2.5
 v4_viewport_w dd 2.5, 2.5, 2.5, 2.5
-v4_pixels_w   dd 128.0, 128.0, 128.0, 128.0
-v4_pixels_h   dd 128.0, 128.0, 128.0, 128.0
+v4_pixels_w   dd 256.0, 256.0, 256.0, 256.0
+v4_pixels_h   dd 256.0, 256.0, 256.0, 256.0
 v4_boxmin     dd -0.5, -0.5, -0.5, -0.5
 v4_boxmax     dd 0.5, 0.5, 0.5, 0.43
-v4_albedo     dd 0.66, 0.66, 0.66, 0.66
+v4_albedo     dd 0.66, 0.66, 0.66, 1.0
 v4_negative_one dd -1.0, -1,0, -1.0, -1.0
 
 ; gl data
