@@ -22,9 +22,14 @@ clean:
 	rm -f $(GEN_DIR)/generate
 	rm -f $(GEN_DIR)/generated_data.asm
 
+profile: bin/empedocles
+	(cd bin && \
+	    valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes --dump-instr=yes --callgrind-out-file=cachegrind_out ./empedocles \
+	    kcachegrind ./cachegrind_out)
+
 # Leafier targets
 build/main.o: code/main.asm $(INCLUDED) $(GEN_DIR)/generated_data.asm
-	fasm code/main.asm build/main.o -m 1000000
+	fasm -s out.debug code/main.asm build/main.o -m 1000000
 
 $(GEN_DIR)/generated_data.asm: $(SHADERS) $(GEN_DIR)/generate
 	$(GEN_DIR)/generate

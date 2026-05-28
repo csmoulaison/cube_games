@@ -1,6 +1,8 @@
 ;= TODOS ===================================================
-; * Arbitary voxel grid roation (cam/viewport transform)
-; * SIMD instructions
+; * Multi-threading with atomic increment memory regions
+; * Metallic reflection
+; * Refraction - with chance of reflection
+; * AVX-512 path - with wavefront approach
 ;===========================================================
 
 ;= VECTORIZATION IDEAS =====================================
@@ -9,9 +11,15 @@
 ; a breadth first approach, queuing further operations for
 ; the next pass.
 ;
-; This can get quite complicated in production path tracers,
-; but we can take advantage of the relative simplicity of
-; our materials to do better.
+; The BVH/object hierarchy is laid out in memory with the
+; each level of the hierarchy contiguous, i.e.
+;
+;   |OBJ_1|OBJ_2|OBJ_3 \
+;   |OBJ_1.1|OBJ_1.2|OBJ_2.1|OBJ_3.1|OBJ_3.2 \
+;   |OBJ_1.1.1|OBJ_1.1.2 ...
+;
+; Each OBJ can be either a bounding hierarchy parent or a
+; leaf object
 ;
 ; When a ray is traced, we first traverse the BVH, and the
 ; relevant information (bounding id, ray) is queued into an
@@ -40,19 +48,6 @@ format ELF64
 section '.text' executable
 ;===========================================================
 
-include 'vec3.asm'
-include 'rand.asm'
-
-CLONE_VM      = 0x00000100
-CLONE_FS      = 0x00000200
-CLONE_FILES	  = 0x00000400
-CLONE_SIGHAN  = 0x00000800
-CLONE_PARENT  = 0x00008000
-CLONE_THREAD  = 0x00010000
-CLONE_IO      = 0x80000000
-CLONE_FLAGS = CLONE_VM or CLONE_FS or CLONE_FILES or CLONE_SIGHAN or CLONE_PARENT or CLONE_THREAD or CLONE_IO
-
-
 ; When linking with gl3w, we ge an undefined reference to
 ; __dso_handle. This shit is a little too esoteric for my
 ; paygrade, but defining it here like this seems to work.
@@ -60,11 +55,23 @@ public __dso_handle
 __dso_handle:
     dd 0
 
-; libc
+include 'vec3.asm'
+include 'rand.asm'
+
+CLONE_VM     = 0x00000100
+CLONE_FS     = 0x00000200
+CLONE_FILES	 = 0x00000400
+CLONE_SIGHAN = 0x00000800
+CLONE_PARENT = 0x00008000
+CLONE_THREAD = 0x00010000
+CLONE_IO     = 0x80000000
+CLONE_FLAGS = CLONE_VM or CLONE_FS or CLONE_FILES or CLONE_SIGHAN or CLONE_PARENT or CLONE_THREAD or CLONE_IO
+
+; Libc
+extrn printf
 extrn sinf
 extrn cosf
-extrn printf
-; glfw
+; Glfw
 extrn glfwInit
 extrn glfwCreateWindow
 extrn glfwWindowHint
@@ -74,7 +81,7 @@ extrn glfwSwapBuffers
 extrn glfwPollEvents
 extrn glfwTerminate
 extrn glfwGetFramebufferSize
-; gl
+; OpenGL
 extrn glClearColor
 extrn glClear
 extrn glViewport
@@ -100,10 +107,11 @@ extrn glGetShaderiv
 extrn glGetShaderInfoLog
 extrn glUseProgram
 extrn glDrawArrays
-; gl3w
+; Gl3w
 extrn gl3wInit
 extrn gl3wIsSupported
 
+;= START ===================================================
 public _start
 _start:
     ; Initialize glfw
@@ -192,8 +200,7 @@ _start:
 
     mov     ebx, [verts_len]
     mov     ebp, 4
-    imul    ebp, ebx            ; TODO: learn about mul and imul. something
-                                ; something lower bits
+    imul    ebp, ebx            
     mov     ecx, 0x88E4         ; GL_STATIC_DRAW
     mov     rdx, verts
     mov     esi, ebp
@@ -233,192 +240,36 @@ _start:
     mov     edi, r12d           ; after deleting shaders, r12, r13 are free
     call    glDeleteShader
     mov     edi, r13d
-    call    glDeleteShader 
+    call    glDeleteShader
 
-;= MAIN LOOP ===============================================
-; This runs repeatedly until the program wants to exit
+;= THREAD MANAGEMENT =======================================
+; Threads go through the following lifecycle until the
+; program ends.
+;
+;   thread_idle: wait for pixel regions to be available then
+;   jump to render_region
+;
+;   render_region: render a region of pixels and return to
+;   thread_idle
+;
+; The host thread participates in the same loop, except when
+; there are no regions available, at which point it does the
+; following tasks:
+;
+;   end_frame: swap the buffer and jump to start_frame
+;
+;   start_frame: pre-prepare the data used in render_region
+;   such as camera/viewport data, set the region counter to
+;   0, then jump to thread_idle
+;
+; After allocating all the threads at the start of the
+; program, the host goes straight to preparing the first
+; frame.
 ;===========================================================
-loop_begin:
-    mov     rdi, [glfw_window]
-    call    glfwWindowShouldClose
-    cmp     eax, 1
-    je      exit
-
-    ; Orbit camera around the origin
-    ;   x = dist * sin(phi) * cos(theta);
-    ;   y = dist * cos(phi);
-    ;   z = dist * sin(phi) * sin(theta);
-    ; theta being left/right and phi being up/down
-    movss   xmm0, [cam_theta]   ; xmm0, cam_theta
-    addss   xmm0, [cam_theta_per_sec]
-    movss   [cam_theta], xmm0   ; cam_theta += cam_theta_per_second
-
-    movss   xmm0, [cam_theta]
-    call    cosf
-    movss   xmm6, xmm0          ; xmm6: cos(theta)
-    movss   xmm0, [cam_phi]
-    call    sinf
-    movss   xmm7, xmm0          ; xmm7: sin(phi)
-    movss   xmm0, [cam_phi]
-    call    cosf
-    movss   xmm8, xmm0          ; xmm8: cos(phi)
-    movss   xmm0, [cam_theta]
-    call    sinf                ; xmm0: sin(theta)
-
-    movss   xmm9, [cam_dist]    ; xmm9-11 will be x,y,z
-    movss   xmm10, [cam_dist]
-    movss   xmm11, [cam_dist]   ; xmm9-11: cam_dist
-
-    mulss   xmm9, xmm7          ; xmm4: dist * sin(phi)
-    mulss   xmm9, xmm6          ; xmm4: x = dist * sin(phi) * cos(theta)
-    mulss   xmm10, xmm8         ; xmm5: y = dist * cos(phi)
-    mulss   xmm11, xmm0         ; xmm6: dist * sin(theta)
-    mulss   xmm11, xmm7         ; xmm6: z = dist * sin(phi) * sin(theta)
-
-    movss   [v4_lookfrom+0x00], xmm9
-    movss   [v4_lookfrom+0x04], xmm10
-    movss   [v4_lookfrom+0x08], xmm11
-
-    ;mov     rax, 3
-    ;cvtss2sd xmm2, xmm9
-    ;cvtss2sd xmm1, xmm10
-    ;cvtss2sd xmm0, xmm11
-    ;mov     rdi, debug_msg
-    ;call    printf
-
-;= RENDER PROCEDURE ========================================
-; At a high level, our goal is such:
-; for each pixel
-;    map pixel to a viewport position
-;    cast ray from origin through viewport position
-;    for each cube
-;        determine if cube intersects with ray
-;        add cube color to sum
-;    write summed color to pixel buffer
-;
-; More specifically:
-; Implicitly, we have a camera centered at (0,0,0) pointing
-; down the +Z axis, with +Y above and +X to the right. We
-; have a viewport at some viewport_distance down the +Z
-; axis.
-;
-; For each (x,y) pixel, we get the position on the viewport
-; by scaling and adding x and y vectors along the viewport
-; by the same ratio of pixel to screen size. We then add a
-; random amount to the resulting viewport position such
-; that our final position is randomly placed within the
-; bounds of the viewport "pixel". We define the ray as
-; (viewport_pos - cam_pos), which in this case is the same
-; as viewport_pos, since the camera is at the origin.
-;   (cam_pos will eventually be defined so that we can
-;    rotate the camera around the voxels)
-;
-; We intersect the ray against 9 axis aligned cubes, summing
-; the "time spent" by the ray in each cube to get our final
-; color.
-;
-; We are more or less doing this at the moment:
-;   (https://raytracing.github.io/books/RayTracingInOneWeekend.html)
-;===========================================================
-    ; Initialization is dedicated to getting these values,
-    ; and these registers will be stable throughout the
-    ; inner pixel loop:
-    ;   xmm12: pixel delta u
-    ;   xmm13: pixel delta v
-    ;   xmm14: pixel center at uv (0,0)
-    ;   xmm15: look from, camera origin
-    movaps  xmm15, dqword [v4_lookfrom] ; xmm15 has lookfrom
-
-    ; Calculate camera basis vectors:
-    ;   xmm8  <- u = norm(cross(up, w))
-    ;   xmm9  <- v = cross(w, u)
-    ;   xmm10 <- = norm(from - at)
-    ; xmm10 must remain stable until the viewport origin has
-    ; been calculated.
-    movaps  xmm10, xmm15        ; xmm10: lookfrom
-    movaps  xmm1, dqword [v4_lookat] ; xmm1: lookat
-    subps   xmm10, xmm1         ; xmm0: from - to
-    v3norm  xmm10               ; xmm10: basis w
-
-    movaps  xmm8, dqword [v4_upvector] ; xmm0: upvector
-    movaps  xmm1, xmm10         ; xmm1: basis w
-    v3cross xmm8, xmm1
-    v3norm  xmm8                ; xmm8: basis u
-
-    movaps  xmm9, xmm10
-    movaps  xmm1, xmm8
-    v3cross xmm9, xmm1          ; xmm9: basis v
-
-    ; viewport_u = scale(viewport_w, basis_u)
-    ; viewport_v = scale(-viewport_h, basis_v)
-    movaps  xmm1, dqword [v4_viewport_w]
-    mulps   xmm8, xmm1          ; xmm8: viewport u
-
-    movaps  xmm1, dqword [v4_viewport_h] ; viewport_h is negative because y coordinates
-    mulps   xmm9, xmm1          ; xmm9: viewport v
-
-    ; pixel_u = div(viewport_u, pixels_w)
-    ; pixel_v = div(viewport_w, pixels_h)
-    movaps  xmm12, xmm8
-    movaps  xmm0, dqword [v4_pixels_w]
-    divps   xmm12, xmm0         ; xmm12: pixel delta u
-
-    movaps  xmm13, xmm9
-    movaps  xmm0, dqword [v4_pixels_h]
-    divps   xmm13, xmm0         ; xmm13: pixel delta v
-
-    ; viewport_origin = lookfrom - (focal_length * basis_w) - div(viewport_u, 2,0) - div(viewport_v, 2.0)
-    movaps  xmm14, dqword [v4_focal_len] ; using xmm14, we will eventually build pixel00
-    mulps   xmm14, xmm10        ; xmm10 should be basis_w still, which means...
-                                ; xmm14: focal_length * basis_w
-                                ; xmm10 is now free for use
-    subps   xmm14, xmm15        ; xmm14: lookfrom - (focal_length * basis_w)
-    movaps  xmm0, dqword [v4_half] ; xmm0: v4(0.5) also used in pixel00 calculation
-    mulps   xmm8, xmm0          ; xmm8: div(viewport_u, 2.0)
-    mulps   xmm9, xmm0          ; xmm9: div(viewport_v, 2.0)
-    subps   xmm14, xmm8
-    subps   xmm14, xmm9         ; xmm14: viewport_origin
-
-    ; pixel00 = viewport_origin + (0.5 * (pixel_delta_u + pixel_delta_v));
-    ;movaps  xmm1, xmm12         ; xmm1: pixel_delta_u
-    ;addps   xmm1, xmm13         ; xmm1: pd_u + pd_v
-    ;mulps   xmm1, xmm0          ; xmm1: 0.5 * (pd_u + pd_v)
-    ;addps   xmm14, xmm1         ; xmm14: pixel00
-
-; We've gathered the values listed above in xmm12-15 and
-; now it's time to do the tight pixel loop.
-;
-; For now, we assume SSE 4.2 suppport. Once we get to deeper
-; optimizations, we should make versions of this loop for
-; sse 4.2, avx, avx2, and avx256
-;
-; Here's a good scheme which is nicely scaleable to
-; different instruction sets:
-;
-; Cube mins/maxes are packed into stack memory, and the
-; blah blah you get the picture. Let's try to do shitty
-; first then work with simd shit.
-;
-; NOTE: when we multithread/simd, doing square chunks of the
-; screen makes no sense both for cache locality and perhaps
-; more importantly, for distributing work equally. The
-; corners of the screen, for instance, will have less
-; intersections than the center. So, we should instead have
-; each execution unit process a row of pixels at a time,
-; skipping rows equalling the number of threads so that each
-; thread hypothetically touches the cuby bits a roughly
-; equal number of times. This might mean a cache miss every
-; time a row is done, but I feel like we still win over the
-; stalling that would obviously happen if we chunked it up
-; differently. Maybe try to find the right balance. Not
-; rows perhaps, but some number of pixels processed before
-; skipping. Could graph it!
-
 repeat thread_count-1
     mov     rax, 56             ; sys_clone
-    ; flags CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD
-    mov     rdi, CLONE_FLAGS
-    lea     rsi, [pixels]       ; child stack pointer
+    mov     rdi, CLONE_FLAGS    ; flags
+    lea     rsi, [thread_mem+thread_mem_size*%] ; child stack pointer
     mov     rdx, 0              ; parent thread id
     mov     r10, %              ; child thread id
     mov     r8, 0               ; child thread local storage
@@ -426,18 +277,43 @@ repeat thread_count-1
     mov     r15, rax            ; r15: parent or child result
 
     xor     r13, r13
-    mov     r13, %
-    lea     r14, [pixels+pixel_buffer_size*%]
+    mov     r13, (%+1)*4            ; r13 is used to index into a random seed
     cmp     r15, 0
-    je      thread_start
-    jl      exit
+    je      thread_idle         ; if we are the child, we go straight to idle
+    jl      exit                ; error creating thread
 end repeat
     mov     r13, 0
-    lea     r14, [pixels]
+    jmp     start_frame
 
-thread_start:
-    xor     edi, edi             ; edi: pixel counter
-pixel_loop_begin:
+thread_idle:
+    mov     eax, 1
+    lock xadd [pixel_region_counter], eax ; eax is the next region index
+    cmp     eax, pixel_regions_len
+    jge     threads_complete
+    mov     edi, pixel_regions_stride
+    mul     edi                 ; edi: pixel_regions_stride * region index
+    mov     edi, eax            ; edi: pixel start index
+    mov     r14d, edi
+    add     r14d, pixel_regions_stride ; r14: pixel end index
+    jmp     render_region
+    
+threads_complete:
+    cmp     r15, 0              ; check if we are child or parent thread
+    je      thread_idle         ; children keep waiting
+    jmp     end_frame           ; host prepares the next frame
+
+;= RENDER REGION ===========================================
+; This is the task which is pulled by threads concurrently.
+; Renders a contiguous region of the pixel buffer.
+;===========================================================
+render_region:
+    movaps xmm12, dqword [v4_pixel_delta_u]
+    movaps xmm13, dqword [v4_pixel_delta_v]
+    movaps xmm14, dqword [v4_viewport_root]
+    movaps xmm15, dqword [v4_look_from]
+; We've gathered the values listed above in xmm12-15 and
+; now it's time to do the tight pixel loop.
+pixel_start:
     xor     edx, edx
     mov     eax, edi
     div     dword [i_pixels_w]
@@ -449,8 +325,6 @@ pixel_loop_begin:
     ; current pixel coordinates, then taking the delta
     ; between that position and the camera origin and
     ; normalizing it.
-    ;
-    ; TODO: sample a random point within the viewport pixel
     cvtsi2ss xmm11, esi         ; xmm11 will become ray direction
     frand_unsigned xmm10
     addps   xmm11, xmm10
@@ -466,7 +340,7 @@ pixel_loop_begin:
     addps   xmm11, xmm1
     addps   xmm11, xmm14        ; xmm11: pixel center
     subps   xmm11, xmm15        ; xmm11: ray direction
-    ;v3norm  xmm11               ; normalize ray direction
+    ;v3norm  xmm11              ; normalize ray direction
 
     movaps  xmm10, xmm15        ; xmm10: ray origin from camera position
     movaps  xmm9, dqword [v4_one] ; xmm9: color attenuation starts at v4(1.0)
@@ -487,7 +361,7 @@ trace_ray:
     ; We determine whether the ray intersects with an
     ; axis aligned box centered at the origin.
     ;
-    ; TODO: Inigo with the clutch:
+    ; Inigo with the clutch:
     ;   (https://iquilezles.org/articles/intersectors/)
     ; Box size centered at origin, transform origin and dir accordingly
 
@@ -562,20 +436,6 @@ trace_ray:
 
     ; Calculate diffuse reflection
 
-    ; TODO: I think this is where our issue is currently.
-    ; The normal seems to be correct, and its just the
-    ; process of calculating a lambertian reflection about
-    ; that normal that is going wrong for one sign of the
-    ; axes.
-    ;
-    ; I think the next step is probably to do some actual
-    ; dumping of data from these frand_normals to see if the
-    ; resulting numbers are distributed how we want.
-    ;
-    ; We can also debug and see if the blendps lanes are
-    ; correct. (though I think I played around with it
-    ; enough to determine that they are.
-
     ; usable xmm registers: xmm1, xmm2, xmm3, xmm4, xmm6, xmm7
     ;pxor    xmm7, xmm7
     frand_normal xmm7
@@ -598,7 +458,6 @@ trace_ray:
     jmp     trace_ray
 
 calculate_pixel_color:
-    ; TODO: multiply attenuation by sky (ray) color
     movaps  xmm8, xmm11
     v3norm  xmm8
     andps   xmm8, dqword [abs_mask] ; xmm8: absolute value for color
@@ -608,48 +467,20 @@ calculate_pixel_color:
     cvtps2dq xmm8, xmm8         ; convert to dword integers
     packusdw xmm8, xmm8         ; pack into 16bit words
     packuswb xmm8, xmm8         ; pack into bytes
-    movd    dword [r14+rdi*4], xmm8 ; move to pixel location
+
+    movd    dword [pixels+edi*4], xmm8 ; move to pixel location
     inc     edi
-    cmp     edi, pixels_len
-    jl      pixel_loop_begin
+    cmp     edi, r14d
+    jl      pixel_start
 
-; DONE CALCULATING PIXELS
+    ; If we have calculated the entire render pass, we
+    ; return to thread_idle. Once we are rendering multiple
+    ; samples per thread, we would go back to do more
+    ; samples here.
+    jmp     thread_idle
 
-    cmp     r15, 0              ; check if we are child or parent thread
-    jne     wait_join
-    mov     rax, 60             ; exit if child
-    xor     rdi, rdi
-    syscall 
-
-wait_join:
-repeat thread_count-1
-    mov     rax, 35             ; sys_wait4
-    mov     rdi, %              ; child pid
-    mov     rsi, 0              ; exit status addr
-    mov     rdx, 0              ; options
-    mov     r10, 0              ; rusage
-    syscall
-end repeat
-
-; Now we loop through pixels again, averaging the colors
-    mov     rdi, 0
-pixel_average_begin:
-    movzx   eax, [pixels+rdi]
-
-repeat thread_count-1
-    movzx   edx, [pixels+(pixel_buffer_size*%)+rdi]
-    add     eax, edx
-end repeat
-    ; Prepare for division (Sum is in EAX, Count is 4)
-    xor     edx, edx
-    mov     ebx, thread_count
-    div     ebx
-    mov     byte [pixels+rdi], al
-    
-    inc     rdi
-    cmp     rdi, pixels_len * 4
-    jl      pixel_average_begin
-
+;= END FRAME ===============================================
+end_frame:
     ; Update GL data
     push    0
     push    pixels
@@ -703,9 +534,176 @@ end repeat
     mov     rdi, [glfw_window]  ; Main loop end
     call    glfwSwapBuffers
     call    glfwPollEvents
-    jmp     loop_begin
 
-error:                          ; TODO: Implement error messages
+;= START FRAME =============================================
+; Starting a new frame involves the following tasks:
+; * Asking GLFW if we should exit
+; * Updating camera state and calculating viewport info
+; * Notifying threads to start work by setting the region
+;   counter to 0
+;===========================================================
+start_frame:
+    ;============
+    ; QUERY GLFW
+    ;============
+    mov     rdi, [glfw_window]
+    call    glfwWindowShouldClose
+    cmp     eax, 1
+    je      exit
+
+    ;=====================
+    ; UPDATE CAMERA STATE
+    ;=====================
+    ; Orbit camera around the origin
+    ;   x = dist * sin(phi) * cos(theta);
+    ;   y = dist * cos(phi);
+    ;   z = dist * sin(phi) * sin(theta);
+    ; theta being left/right and phi being up/down
+    movss   xmm0, [cam_theta]   ; xmm0, cam_theta
+    addss   xmm0, [cam_theta_per_sec]
+    movss   [cam_theta], xmm0   ; cam_theta += cam_theta_per_second
+
+    movss   xmm0, [cam_theta]
+    call    cosf
+    movss   xmm6, xmm0          ; xmm6: cos(theta)
+    movss   xmm0, [cam_phi]
+    call    sinf
+    movss   xmm7, xmm0          ; xmm7: sin(phi)
+    movss   xmm0, [cam_phi]
+    call    cosf
+    movss   xmm8, xmm0          ; xmm8: cos(phi)
+    movss   xmm0, [cam_theta]
+    call    sinf                ; xmm0: sin(theta)
+
+    movss   xmm9, [cam_dist]    ; xmm9-11 will be x,y,z
+    movss   xmm10, [cam_dist]
+    movss   xmm11, [cam_dist]   ; xmm9-11: cam_dist
+
+    mulss   xmm9, xmm7          ; xmm4: dist * sin(phi)
+    mulss   xmm9, xmm6          ; xmm4: x = dist * sin(phi) * cos(theta)
+    mulss   xmm10, xmm8         ; xmm5: y = dist * cos(phi)
+    mulss   xmm11, xmm0         ; xmm6: dist * sin(theta)
+    mulss   xmm11, xmm7         ; xmm6: z = dist * sin(phi) * sin(theta)
+
+    movss   [v4_look_from+0x00], xmm9
+    movss   [v4_look_from+0x04], xmm10
+    movss   [v4_look_from+0x08], xmm11
+
+    mov     rax, 3
+    cvtss2sd xmm2, xmm9
+    cvtss2sd xmm1, xmm10
+    cvtss2sd xmm0, xmm11
+    mov     rdi, debug_msg
+    ;call    printf
+
+;= RENDER PROCEDURE ========================================
+; At a high level, our goal is such:
+; for each pixel
+;    map pixel to a viewport position
+;    cast ray from origin through viewport position
+;    for each cube
+;        determine if cube intersects with ray
+;        add cube color to sum
+;    write summed color to pixel buffer
+;
+; More specifically:
+; Implicitly, we have a camera centered at (0,0,0) pointing
+; down the +Z axis, with +Y above and +X to the right. We
+; have a viewport at some viewport_distance down the +Z
+; axis.
+;
+; For each (x,y) pixel, we get the position on the viewport
+; by scaling and adding x and y vectors along the viewport
+; by the same ratio of pixel to screen size. We then add a
+; random amount to the resulting viewport position such
+; that our final position is randomly placed within the
+; bounds of the viewport "pixel". We define the ray as
+; (viewport_pos - cam_pos), which in this case is the same
+; as viewport_pos, since the camera is at the origin.
+;   (cam_pos will eventually be defined so that we can
+;    rotate the camera around the voxels)
+;
+; We intersect the ray against 9 axis aligned cubes, summing
+; the "time spent" by the ray in each cube to get our final
+; color.
+;
+; We are more or less doing this at the moment:
+;   (https://raytracing.github.io/books/RayTracingInOneWeekend.html)
+;===========================================================
+    ;= UPDATE_CAMERA_STATE =================================
+    ; Initialization is dedicated to getting these values,
+    ; and these registers will be stable throughout the
+    ; inner pixel loop:
+    ;   xmm12: pixel delta u
+    ;   xmm13: pixel delta v
+    ;   xmm14: pixel center at uv (0,0)
+    ;   xmm15: look from, camera origin
+    ; TODO: these values need to be stored in memory and pulled
+    ; into the proper registers by the threads
+    ;=======================================================
+    movaps  xmm15, dqword [v4_look_from] ; xmm15 has lookfrom
+
+    ; Calculate camera basis vectors:
+    ;   xmm8  <- u = norm(cross(up, w))
+    ;   xmm9  <- v = cross(w, u)
+    ;   xmm10 <- = norm(from - at)
+    ; xmm10 must remain stable until the viewport origin has
+    ; been calculated.
+    movaps  xmm10, xmm15        ; xmm10: lookfrom
+    movaps  xmm1, dqword [v4_lookat] ; xmm1: lookat
+    subps   xmm10, xmm1         ; xmm0: from - to
+    v3norm  xmm10               ; xmm10: basis w
+
+    movaps  xmm8, dqword [v4_upvector] ; xmm0: upvector
+    movaps  xmm1, xmm10         ; xmm1: basis w
+    v3cross xmm8, xmm1
+    v3norm  xmm8                ; xmm8: basis u
+
+    movaps  xmm9, xmm10
+    movaps  xmm1, xmm8
+    v3cross xmm9, xmm1          ; xmm9: basis v
+
+    ; viewport_u = scale(viewport_w, basis_u)
+    ; viewport_v = scale(-viewport_h, basis_v)
+    movaps  xmm1, dqword [v4_viewport_w]
+    mulps   xmm8, xmm1          ; xmm8: viewport u
+
+    movaps  xmm1, dqword [v4_viewport_h] ; viewport_h is negative because y coordinates
+    mulps   xmm9, xmm1          ; xmm9: viewport v
+
+    ; pixel_u = div(viewport_u, pixels_w)
+    ; pixel_v = div(viewport_w, pixels_h)
+    movaps  xmm12, xmm8
+    movaps  xmm0, dqword [v4_pixels_w]
+    divps   xmm12, xmm0         ; xmm12: pixel delta u
+
+    movaps  xmm13, xmm9
+    movaps  xmm0, dqword [v4_pixels_h]
+    divps   xmm13, xmm0         ; xmm13: pixel delta v
+
+    ; viewport_origin = lookfrom - (focal_length * basis_w) - div(viewport_u, 2,0) - div(viewport_v, 2.0)
+    movaps  xmm14, dqword [v4_focal_len] ; using xmm14, we will eventually build pixel00
+    mulps   xmm14, xmm10        ; xmm10 should be basis_w still, which means...
+                                ; xmm14: focal_length * basis_w
+                                ; xmm10 is now free for use
+    subps   xmm14, xmm15        ; xmm14: lookfrom - (focal_length * basis_w)
+    movaps  xmm0, dqword [v4_half] ; xmm0: v4(0.5) also used in pixel00 calculation
+    mulps   xmm8, xmm0          ; xmm8: div(viewport_u, 2.0)
+    mulps   xmm9, xmm0          ; xmm9: div(viewport_v, 2.0)
+    subps   xmm14, xmm8
+    subps   xmm14, xmm9         ; xmm14: viewport_origin
+
+    ; TODO: don't use the registers at all or whatever
+    movaps  dqword [v4_viewport_root], xmm14
+    movaps  dqword [v4_pixel_delta_v], xmm13
+    movaps  dqword [v4_pixel_delta_u], xmm12
+
+    xor eax, eax
+    xchg [pixel_region_counter], eax
+    ;mov    [pixel_region_counter], 0
+    jmp     thread_idle
+
+error:
     jmp     exit
 
 exit:
@@ -772,60 +770,106 @@ compile_shader_success:
     add     rsp, 40
     ret
 
-;= PUT COLOR ===============================================
-; Writes an rgb value to the pixels buffer.
-;
-; NOTE: This will likely be inlined as part of the render
-; loop, obvs
-;
-; input:
-;   edx: color
-;   rsi: y
-;   rdi: x
-; output: none
-;===========================================================
-put_color:
-    add     rsp, 8
-    mov     [rsp], edx
-    mov     r10, rsi
-    xor     rax, rax
-    mov     eax, pixels_w
-    mul     r10
-    mov     r10, rax
-    add     r10, rdi            ; r10 is now (y * width + x)
-    mov     rax, 4
-    mul     r10                 ; multiply r10 by color channels (4)
-    lea     r9, [pixels+rax]    ; r9 now pointing to screen pixel
-    mov     r11, [rsp]
-    mov     dword [r9], r11d    ; Write pixel
-    sub     rsp, 8
-
 ;===========================================================
 section '.data' writeable align 16
 ;===========================================================
 
 msglen       = 4096
 ; WARNING: v4_pixels__ below needs to match these
-pixels_w     = 256
-pixels_h     = 256
+pixels_w     = 1024
+pixels_h     = 1024
 pixels_len   = pixels_w * pixels_h
 pixel_buffer_size = pixels_len * 4
+pixel_regions_stride = pixels_w / 4
+pixel_regions_len = pixels_len / pixel_regions_stride
 bounce_max   = 10
+
 thread_count = 12 ; add rand_seed and new threads
+thread_mem_size = 128
 
 msg         rd msglen           ; general purpose string buffer
 window_name db 'Empedocles Renderer', 0
 
 debug_msg   db 'cam %f, %f, %f', 10, 0
 
+;= SHARED MEMORY ===========================================
+; The bounding volume hierarchy is laid out in memory with
+; each level of the hierarchy contiguous, i.e.
+;
+;   |VOL_1     |VOL_2     |VOL_3   | ...
+;   |VOL_1.1   |VOL_1.2   |VOL_2.1 |VOL_3.1 |VOL_3.2 | ...
+;   |VOL_1.1.1 |VOL_1.1.2 | ...
+;
+; A volume can be either a parent or a leaf object. Though
+; they include different data, each volume is the same
+; static size for indexing.
+;
+;- Volume Data Layout --------------------------------------
+; 48 Bytes |+0. ... ... ...|+16 ... ... ...|+32 +36 ... ...|
+; Parent   |Box Origin  ...|Box Size    ...|pid psz lid lsz|
+; Leaf     |Box Origin  ...|Box Size    ...|alb rfl ems ...|
+;-----------------------------------------------------------
+; Parent data:
+;   pid: start index of parent nodes in bounded space
+;   psz: number of parent nodes in bounded space
+;   lid: start index of leaf nodes in bounded space
+;   lsz: number of leaf nodes in bounded space
+; Leaf data:
+;   alb: albedo
+;   rfl: reflect chance
+;   ems: emit chance
+;-----------------------------------------------------------
+;===========================================================
+align 16
+
+;= THREAD LOCAL MEMORY =====================================
+; Threads keep track of their own set of multiple operation
+; lists. Elements in the list all represent both the state
+; and next operation needed by a ray.
+;
+; The operations are as follows:
+;
+;   Intersect: Test for intersections against objects in a
+;   given bounded space. If the intersection is against a
+;   parent volume, queue another intersect operation against
+;   its children. If against a leaf volume, queue a bounce
+;   operation. If against the sky, queue a termination.
+;
+;   Bounce: Calculate the type of reaction based on the
+;   material properties. If the reaction is emissive,
+;   queue a termination, otherwise calculate the new ray
+;   origin and direction and queue an intersect operation
+;   against the root volume.
+;
+;   Terminate: Calculate and store the final color by
+;   dividing the summed color by the number of bounces,
+;   convert to RGBA, and write to the pixel buffer.
+;
+; Operations are laid out in memory to fit the register size
+; relevant to the current code path. In AVX-512, for
+; instance, we want to group all the vectors and values by
+; type contiguously, i.e.:
+;
+; |ro,ro,ro,ro,ro|rd,rd,rd,rd,rd|col,col,col,col,col|
+;
+; Figure out the best way to go based on the actual
+; operations.
+;
+;===========================================================
+align 16
+thread_mem rb thread_mem_size * thread_count
+
 ; render data
 align 16
-pixels            rb pixel_buffer_size * (thread_count + 1)
+pixel_region_counter dd 0
+align 16
+pixels            rb pixel_buffer_size
 rand_seed:
-    dd 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, \
+    dq 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, \
     100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1300, 1400, 1500, 1600, 1700, 1800, \
     111, 211, 311, 411, 511, 611, 711, 811, 911, 1110, 1211, 1311, 1411, 1511, 1611, 1711, 1811, \
     221, 222, 322, 422, 522, 622, 722, 822, 922, 2210, 1222, 1322, 1422, 1522, 1622, 1722, 1822
+align 16
 clear_r           dd 0.3
 clear_g           dd 0.1
 clear_b           dd 0.2
@@ -837,6 +881,13 @@ cam_theta_per_sec dd 0.02
 cam_dist          dd 2.0
 ; Aligned and quadrupled for use in xmm registers
 align 16
+
+; pulled from registers at start. refactor
+v4_pixel_delta_u dd 0.0, 0.0, 0.0, 0.0
+v4_pixel_delta_v dd 0.0, 0.0, 0.0, 0.0
+v4_viewport_root dd 0.0, 0.0, 0.0, 0.0
+v4_look_from     dd 0.0, 0.0, 0.0, 0.0
+
 ; useful numbers
 v4_inf          dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
 v4_negative_inf dd 0xFF800000, 0xFF800000, 0xFF800000, 0xFF800000
@@ -859,14 +910,13 @@ v4_normals:
 v4i_zero        dd 0, 0, 0, 0
 
 ; constants
-v4_lookfrom   dd 0.0, 0.0, 0.0, 0.0
 v4_lookat     dd 0.0, 0.0, 0.0, 0.0
 v4_upvector   dd 0.0, 1.0, 0.0, 0.0
 v4_focal_len  dd 2.0, 2.0, 2.0, 2.0
 v4_viewport_h dd -2.5, -2.5, -2.5, -2.5
 v4_viewport_w dd 2.5, 2.5, 2.5, 2.5
-v4_pixels_w   dd 256.0, 256.0, 256.0, 256.0
-v4_pixels_h   dd 256.0, 256.0, 256.0, 256.0
+v4_pixels_w   dd 1024.0, 1024.0, 1024.0, 1024.0
+v4_pixels_h   dd 1024.0, 1024.0, 1024.0, 1024.0
 v4_boxmin     dd -0.5, -0.5, -0.5, -0.5
 v4_boxmax     dd 0.5, 0.5, 0.5, 0.43
 v4_albedo     dd 0.66, 0.66, 0.66, 1.0
