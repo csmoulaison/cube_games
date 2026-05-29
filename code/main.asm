@@ -293,17 +293,18 @@ if thread_count > 1
 else
     mov     r15, 1              ; r15 needs to be set to not 0 or else we'll
 end if                          ; think we are a child thread.
-
     mov     r14, [rand_seeds]   ; if we are the host we need to set our seed
     jmp     start_frame
 
 thread_idle:
+    cmp     [exit_program], 1
+    je      exit_child
     ; TODO: swapping eax and r10d here should enable us to
     ; skip the mov from eax to r10d
     mov     eax, 1
-    lock xadd [pixel_region_counter], eax ; eax is the next region index
+    lock xadd [pixel_regions_started], eax ; eax is the next region index
     cmp     eax, pixel_regions_len
-    jge     threads_complete
+    jge     all_threads_started
     mov     r10d, pixel_regions_stride
     mul     r10d                 ; edi: pixel_regions_stride * region index
     mov     r10d, eax            ; edi: pixel start index
@@ -311,10 +312,12 @@ thread_idle:
     add     r11d, pixel_regions_stride ; r14: pixel end index
     jmp     render_region
     
-threads_complete:
+all_threads_started:
     cmp     r15, 0              ; check if we are child or parent thread
     je      thread_idle         ; children keep waiting
-    jmp     end_frame           ; host prepares the next frame
+    cmp     [pixel_regions_complete], pixel_regions_len
+    jge     end_frame           ; host prepares the next frame
+    jmp     thread_idle
 
 ;= RENDER REGION ===========================================
 ; This is the task which is pulled by threads concurrently.
@@ -496,6 +499,7 @@ write_to_pixel:
     ; return to thread_idle. Once we are rendering multiple
     ; samples per thread, we would go back to do more
     ; samples here.
+    lock add [pixel_regions_complete], 1
     jmp     thread_idle
 
 ;= END FRAME ===============================================
@@ -718,15 +722,20 @@ start_frame:
     movaps  dqword [v4_pixel_delta_u], xmm12
 
     xor eax, eax
-    xchg [pixel_region_counter], eax
-    ;mov    [pixel_region_counter], 0
+    xchg [pixel_regions_complete], eax
+    xor eax, eax
+    xchg [pixel_regions_started], eax
+    ;mov    [pixel_regions_started], 0
+    ;mov    [pixel_regions_complete], 0
     jmp     thread_idle
 
 error:
     jmp     exit
 
 exit:
+    mov     [exit_program], 1
     call    glfwTerminate
+exit_child:
     mov     rax, 60             ; exit
     xor     rdi, rdi
     syscall 
@@ -798,11 +807,11 @@ pixels_length        = 256
 fpixels_length equ 256.0
 pixels_count         = pixels_length * pixels_length
 pixel_buffer_size    = pixels_count * 4
-pixel_regions_stride = 1024
+pixel_regions_stride = pixels_length
 pixel_regions_len    = pixels_count / pixel_regions_stride
 thread_count         = 12
-sample_count         = 8
-fsample_count equ 8.0
+sample_count         = 100
+fsample_count equ 100.0
 
 align 64
 pixels rb pixel_buffer_size
@@ -814,7 +823,11 @@ repeat thread_count
 end repeat
 
 align 64
-pixel_region_counter dd 0
+exit_program           dd 0
+align 64
+pixel_regions_started  dd 0
+align 64
+pixel_regions_complete dd 0
 
 align 64
 msglen       = 4096
@@ -896,33 +909,35 @@ clear_r           dd 0.3
 clear_g           dd 0.1
 clear_b           dd 0.2
 clear_a           dd 1.0
-i_pixels_length   dd pixels_length
 cam_theta         dd -1.1
 cam_phi           dd 2.1
-cam_theta_per_sec dd 0.02
+cam_theta_per_sec dd 0.03
 cam_dist          dd 2.0
+i_pixels_length   dd pixels_length
 
 align 64
 ; pulled from registers at start. refactor
 v4_pixel_delta_u dd 0.0, 0.0, 0.0, 0.0
 v4_pixel_delta_v dd 0.0, 0.0, 0.0, 0.0
-v4_viewport_root dd 0.0, 0.0, 0.0, 0.0
 v4_look_from     dd 0.0, 0.0, 0.0, 0.0
+v4_viewport_root dd 0.0, 0.0, 0.0, 0.0
 
 ; useful numbers
 align 64
+v4_one          dd 1.0, 1.0, 1.0, 1.0
+v4_sign_mask    dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
+abs_mask        dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
+v4_boxmax       dd 0.5, 0.5, 0.5, 0.43
 v4_inf          dd 0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000
 v4_negative_inf dd 0xFF800000, 0xFF800000, 0xFF800000, 0xFF800000
-v4_sign_mask    dd 0x80000000, 0x80000000, 0x80000000, 0x80000000
-v4_zero         dd 0.0, 0.0, 0.0, 0.0
 v4_eps          dd 0.02, 0.02, 0.02, 0.02
+v4_albedo       dd 0.66, 0.66, 0.66, 1.0
+v4_255          dd 255.0, 255.0, 255.0, 255.0
+v4_zero         dd 0.0, 0.0, 0.0, 0.0
 v4_half         dd 0.5, 0.5, 0.5, 0.5
-v4_one          dd 1.0, 1.0, 1.0, 1.0
 v4_two          dd 2.0, 2.0, 2.0, 2.0
 v4_three        dd 3.0, 3.0, 3.0, 3.0
 v4_four         dd 4.0, 4.0, 4.0, 4.0
-v4_255          dd 255.0, 255.0, 255.0, 255.0
-abs_mask        dd 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF
 v4i_zero        dd 0, 0, 0, 0
 
 ; constants
@@ -935,8 +950,6 @@ v4_viewport_w   dd 2.5, 2.5, 2.5, 2.5
 v4_pixels_w     dd fpixels_length, fpixels_length, fpixels_length, fpixels_length
 v4_pixels_h     dd fpixels_length, fpixels_length, fpixels_length, fpixels_length
 v4_boxmin       dd -0.5, -0.5, -0.5, -0.5
-v4_boxmax       dd 0.5, 0.5, 0.5, 0.43
-v4_albedo       dd 0.66, 0.66, 0.66, 1.0
 v4_negative_one dd -1.0, -1,0, -1.0, -1.0
 
 ; gl data
